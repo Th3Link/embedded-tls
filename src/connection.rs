@@ -135,6 +135,9 @@ where
     traffic_hash: Option<CipherSuite::Hash>,
     secret: Option<EphemeralSecret>,
     certificate_request: Option<CertificateRequest>,
+    /// The number of pre-shared key identities the `ClientHello` offered.
+    psk_identities: usize,
+    server_auth: ServerAuth,
 }
 
 impl<CipherSuite> Handshake<CipherSuite>
@@ -146,8 +149,25 @@ where
             traffic_hash: None,
             secret: None,
             certificate_request: None,
+            psk_identities: 0,
+            server_auth: ServerAuth::None,
         }
     }
+}
+
+/// How far the server has proven its identity. A valid `Finished` only proves that the peer
+/// knows the handshake secret. A peer that chose its own key share always knows it
+/// (RFC 8446, Section 4.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ServerAuth {
+    /// The server has proven nothing yet.
+    None,
+    /// The `Certificate` was accepted, and its `CertificateVerify` has not arrived.
+    Certificate,
+    /// The `CertificateVerify` signature was accepted.
+    Signed,
+    /// The server selected the pre-shared key the client offered.
+    Psk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -395,6 +415,7 @@ where
     Provider: CryptoProvider,
 {
     key_schedule.initialize_early_secret(config.psk.as_ref().map(|p| p.0))?;
+    handshake.psk_identities = config.psk.as_ref().map_or(0, |p| p.1.len());
     let (write_key_schedule, read_key_schedule) = key_schedule.as_split();
     let client_hello = ClientRecord::client_hello(config, crypto_provider);
     let slice = tx_buf.write_record(&client_hello, write_key_schedule, Some(read_key_schedule))?;
@@ -423,6 +444,14 @@ where
                 let shared = server_hello
                     .calculate_shared_secret(&secret)
                     .ok_or(TlsError::InvalidKeyShare)?;
+                if let Some(selected) = server_hello.selected_psk_identity() {
+                    // The server may only select an identity the client offered (RFC 8446,
+                    // Section 4.2.11).
+                    if usize::from(selected) >= handshake.psk_identities {
+                        return Err(TlsError::InvalidHandshake);
+                    }
+                    handshake.server_auth = ServerAuth::Psk;
+                }
                 key_schedule.initialize_handshake_secret(shared.raw_secret_bytes())?;
                 Ok(State::ServerVerify)
             }
@@ -451,6 +480,10 @@ where
                 match server_handshake {
                     ServerHandshake::EncryptedExtensions(_) => {}
                     ServerHandshake::Certificate(certificate) => {
+                        // Once, and not after a pre-shared key was selected.
+                        if handshake.server_auth != ServerAuth::None {
+                            return Err(TlsError::InvalidHandshake);
+                        }
                         let transcript = key_schedule.transcript_hash();
                         if let Ok(verifier) = crypto_provider.verifier() {
                             verifier.verify_certificate(transcript, certificate)?;
@@ -458,19 +491,31 @@ where
                         } else {
                             debug!("Certificate verification skipped due to no verifier!");
                         }
+                        handshake.server_auth = ServerAuth::Certificate;
                     }
                     ServerHandshake::CertificateVerify(verify) => {
+                        // Only for the certificate just received.
+                        if handshake.server_auth != ServerAuth::Certificate {
+                            return Err(TlsError::InvalidHandshake);
+                        }
                         if let Ok(verifier) = crypto_provider.verifier() {
                             verifier.verify_signature(verify)?;
                             debug!("Signature verified!");
                         } else {
                             debug!("Signature verification skipped due to no verifier!");
                         }
+                        handshake.server_auth = ServerAuth::Signed;
                     }
                     ServerHandshake::CertificateRequest(request) => {
                         handshake.certificate_request.replace(request.try_into()?);
                     }
                     ServerHandshake::Finished(finished) => {
+                        // The server must have authenticated itself first: a valid Finished
+                        // alone proves nothing about who the peer is.
+                        if !matches!(handshake.server_auth, ServerAuth::Signed | ServerAuth::Psk) {
+                            warn!("Server Finished without server authentication");
+                            return Err(TlsError::InvalidHandshake);
+                        }
                         if !key_schedule.verify_server_finished(&finished)? {
                             warn!("Server signature verification failed");
                             return Err(TlsError::InvalidSignature);
