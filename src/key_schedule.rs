@@ -47,16 +47,27 @@ where
         label: &[u8],
         context_type: ContextType<CipherSuite>,
     ) -> Result<GenericArray<u8, N>, TlsError> {
-        //info!("make label {:?} {}", label, len);
-        // Max label buffer: hash_output (up to 48 for SHA-384) + 12 (longest label) + 10 (overhead) = 70
-        let mut hkdf_label = heapless::Vec::<u8, 70>::new();
-        hkdf_label
-            .extend_from_slice(&N::to_u16().to_be_bytes())
-            .map_err(|_| TlsError::InternalError)?;
+        let mut okm = GenericArray::default();
+        match context_type {
+            ContextType::None => self.expand_label(label, &[], &mut okm)?,
+            ContextType::Hash(context) => self.expand_label(label, &context, &mut okm)?,
+        }
+        Ok(okm)
+    }
 
-        let label_len = 6 + label.len() as u8;
+    /// HKDF-Expand-Label (RFC 8446 7.1) of `label` and `context` into `okm`.
+    fn expand_label(&self, label: &[u8], context: &[u8], okm: &mut [u8]) -> Result<(), TlsError> {
+        // The label is up to 255 bytes with its "tls13 " prefix, the context
+        // a hash (up to 48 bytes for SHA-384).
+        let mut hkdf_label = heapless::Vec::<u8, { 2 + 1 + 255 + 1 + 48 }>::new();
+        let length = u16::try_from(okm.len()).map_err(|_| TlsError::InternalError)?;
+        let label_len = u8::try_from(6 + label.len()).map_err(|_| TlsError::InternalError)?;
+        let context_len = u8::try_from(context.len()).map_err(|_| TlsError::InternalError)?;
         hkdf_label
-            .extend_from_slice(&label_len.to_be_bytes())
+            .extend_from_slice(&length.to_be_bytes())
+            .map_err(|_| TlsError::InternalError)?;
+        hkdf_label
+            .push(label_len)
             .map_err(|_| TlsError::InternalError)?;
         hkdf_label
             .extend_from_slice(b"tls13 ")
@@ -64,28 +75,16 @@ where
         hkdf_label
             .extend_from_slice(label)
             .map_err(|_| TlsError::InternalError)?;
+        hkdf_label
+            .push(context_len)
+            .map_err(|_| TlsError::InternalError)?;
+        hkdf_label
+            .extend_from_slice(context)
+            .map_err(|_| TlsError::InternalError)?;
 
-        match context_type {
-            ContextType::None => {
-                hkdf_label.push(0).map_err(|_| TlsError::InternalError)?;
-            }
-            ContextType::Hash(context) => {
-                hkdf_label
-                    .extend_from_slice(&(context.len() as u8).to_be_bytes())
-                    .map_err(|_| TlsError::InternalError)?;
-                hkdf_label
-                    .extend_from_slice(&context)
-                    .map_err(|_| TlsError::InternalError)?;
-            }
-        }
-
-        let mut okm = GenericArray::default();
-        //info!("label {:x?}", label);
         self.as_ref()?
-            .expand(&hkdf_label, &mut okm)
-            .map_err(|_| TlsError::CryptoError)?;
-        //info!("expand {:x?}", okm);
-        Ok(okm)
+            .expand(&hkdf_label, okm)
+            .map_err(|_| TlsError::CryptoError)
     }
 }
 
@@ -225,6 +224,7 @@ where
     shared: SharedState<CipherSuite>,
     client_state: WriteKeySchedule<CipherSuite>,
     server_state: ReadKeySchedule<CipherSuite>,
+    exporter_master_secret: Secret<CipherSuite>,
 }
 
 impl<CipherSuite> KeySchedule<CipherSuite>
@@ -242,6 +242,7 @@ where
                 state: KeyScheduleState::new(),
                 transcript_hash: <CipherSuite::Hash as Digest>::new(),
             },
+            exporter_master_secret: Secret::Uninitialized,
         }
     }
 
@@ -364,7 +365,40 @@ where
         //info!("Derive keys, hash: {:x?}", context);
 
         self.calculate_traffic_secrets(b"c ap traffic", b"s ap traffic")?;
+
+        // Same transcript as the application traffic secrets: up to the
+        // server's Finished.
+        let exporter_master_secret = self.shared.derive_secret(
+            b"exp master",
+            ContextType::transcript_hash(&self.server_state.transcript_hash),
+        )?;
+        self.exporter_master_secret.replace(
+            Hkdf::<CipherSuite>::from_prk(&exporter_master_secret)
+                .map_err(|_| TlsError::InternalError)?,
+        );
         self.shared.derived()
+    }
+
+    /// The TLS exporter (RFC 8446 7.5, RFC 5705): fills `out` with keying
+    /// material for `label` and `context`. Available once the handshake is
+    /// done.
+    pub fn export_keying_material(
+        &self,
+        label: &[u8],
+        context: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), TlsError> {
+        let ContextType::Hash(empty) = ContextType::<CipherSuite>::empty_hash() else {
+            return Err(TlsError::InternalError);
+        };
+        let mut secret = HashArray::<CipherSuite>::default();
+        self.exporter_master_secret
+            .expand_label(label, &empty, &mut secret)?;
+        let secret = Hkdf::<CipherSuite>::from_prk(&secret).map_err(|_| TlsError::InternalError)?;
+        let context = <CipherSuite::Hash as Digest>::new()
+            .chain_update(context)
+            .finalize();
+        Secret::<CipherSuite>::Initialized(secret).expand_label(b"exporter", &context, out)
     }
 
     fn calculate_traffic_secrets(

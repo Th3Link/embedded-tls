@@ -88,6 +88,24 @@ where
         self.flush_policy = policy;
     }
 
+    /// Export keying material from the session (RFC 8446 7.5, RFC 5705): fills
+    /// `out` with key material derived for `label` and `context`, the same as the
+    /// server derives. Protocols like NTS (RFC 8915) take their keys from it.
+    ///
+    /// Returns [`TlsError::MissingHandshake`] before the connection is opened.
+    pub fn export_keying_material(
+        &mut self,
+        label: &[u8],
+        context: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), TlsError> {
+        if !*self.opened.get_mut() {
+            return Err(TlsError::MissingHandshake);
+        }
+        self.key_schedule
+            .export_keying_material(label, context, out)
+    }
+
     /// Open a TLS connection, performing the handshake with the configuration provided when
     /// creating the connection instance.
     ///
